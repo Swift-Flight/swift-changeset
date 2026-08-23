@@ -2,9 +2,9 @@ import Foundation
 import Testing
 import Changesets
 
-/// The changeset core (design §3): dirty tracking, effective values, and the
-/// validated handoff.
-@Suite("Changeset — dirty tracking (§1, §6)")
+/// The changeset core: dirty tracking, effective values, and the validated
+/// handoff.
+@Suite("Changeset — dirty tracking")
 struct ChangesetDirtyTrackingTests {
 
     @Test("an insert changeset records every change")
@@ -17,7 +17,7 @@ struct ChangesetDirtyTrackingTests {
         #expect(changeset.original == nil)
     }
 
-    @Test("a change equal to the original is not a change (§6: only if actually changed)")
+    @Test("a change equal to the original is not a change")
     func equalValueIsClean() {
         let changeset = Changeset(original: User.ada)
             .change(\.email, User.ada.email)
@@ -82,7 +82,7 @@ struct ChangesetDirtyTrackingTests {
     }
 }
 
-@Suite("Changeset — validation (§3)")
+@Suite("Changeset — validation")
 struct ChangesetValidationTests {
 
     @Test("validateRequired fails an untouched optional on insert")
@@ -139,7 +139,7 @@ struct ChangesetValidationTests {
         #expect(nilChange.isValid, "nil-ness is validateRequired's job, not a format rule's")
     }
 
-    @Test("errors accumulate across the whole chain — never fail-fast (§1)")
+    @Test("errors accumulate across the whole chain — never fail-fast")
     func errorsAccumulate() {
         let changeset = Changeset(User.self)
             .change(\.email, "nope")
@@ -207,7 +207,7 @@ struct ChangesetValidationTests {
     }
 }
 
-@Suite("Changeset — the driver handoff (§3, §5)")
+@Suite("Changeset — the driver handoff")
 struct ValidatedChangesTests {
 
     @Test("an update hands off only dirty fields, with primary-key identity")

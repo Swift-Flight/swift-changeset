@@ -128,8 +128,9 @@ public struct TableColumn<Model>: Sendable {
     /// `ValidatedChanges.changedFields` / `.identity` and in
     /// `ChangesetError.field`.
     public let name: String
-    /// Whether this column is part of the row's identity (§3: UPDATEs need
-    /// a primary key; inserts don't).
+    /// Whether this column is part of the row's identity.
+    ///
+    /// Updates need a primary key to address the row; inserts do not.
     public let isPrimaryKey: Bool
 
     internal let keyPath: PartialKeyPath<Model> & Sendable

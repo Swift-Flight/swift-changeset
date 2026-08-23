@@ -1,9 +1,8 @@
 import Testing
 import Changesets
 
-/// The rule catalog (§3: "their exact catalog is an implementation detail;
-/// the shape above is the contract"). Exercised through `Changeset.validate`
-/// on insert changesets — the same path production code takes.
+/// The rule catalog. Exercised through `Changeset.validate` on insert
+/// changesets — the same path production code takes.
 @Suite("ValidationRule catalog")
 struct ValidationRuleTests {
 

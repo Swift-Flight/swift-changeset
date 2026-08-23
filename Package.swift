@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.0
 // Swift Changeset — semantic validation, dirty tracking, and the neutral
 // ValidatedChanges handoff a driver translates into its native write.
 // Zero dependencies by design: any persistence layer can consume it.

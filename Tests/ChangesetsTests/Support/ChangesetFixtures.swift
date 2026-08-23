@@ -1,12 +1,11 @@
 import Foundation
 import Changesets
 
-// MARK: - TableModel fixtures (changeset design §3–§6)
+// MARK: - TableModel fixtures
 //
-// Hand conformances, exactly what the Postgres package's @Table bridge (or a
-// future @TableModel macro) would generate. Column names are snake_case
-// deliberately — proving the keypath→column mapping is real, not a property
-// name echo.
+// Hand-written conformances, the same shape a code generator would emit.
+// Column names are snake_case deliberately: it proves the keypath→column
+// mapping is real rather than a property-name echo.
 
 struct User: TableModel, Equatable {
     var id: Int?

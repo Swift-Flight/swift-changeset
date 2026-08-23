@@ -15,8 +15,10 @@ public struct ValidatedChanges: Sendable {
     /// box an `Optional.none` to mean "set to NULL/absent".
     public let changedFields: [String: any Sendable]
 
-    /// Primary-key identity, for UPDATEs. Nil for inserts — nil-ness is how
-    /// a driver distinguishes the two (§5).
+    /// Primary-key identity, for updates.
+    ///
+    /// `nil` for inserts — that nil-ness is how a driver tells the two
+    /// apart without a separate flag.
     public let identity: [String: any Sendable]?
 
     public init(changedFields: [String: any Sendable], identity: [String: any Sendable]?) {
