@@ -8,7 +8,7 @@ import Changesets
 struct ValidationRuleTests {
 
     private func errors<V: Sendable & Equatable>(
-        _ value: V, _ keyPath: WritableKeyPath<User, V>, _ rule: ValidationRule<V>
+        _ value: V, _ keyPath: WritableKeyPath<User, V> & Sendable, _ rule: ValidationRule<V>
     ) -> [ChangesetError] {
         Changeset(User.self).change(keyPath, value).validate(keyPath, rule).errors
     }

@@ -1,22 +1,17 @@
-/// Validates and shapes data *before* it becomes a write (changeset design
-/// §1): accumulates semantic-validation errors, tracks which fields actually
-/// changed from an original, and produces the neutral `ValidatedChanges` a
-/// driver translates into its native write.
+/// Validates and shapes data *before* it becomes a write: accumulates
+/// semantic-validation errors, tracks which fields actually changed from an
+/// original, and produces the neutral ``ValidatedChanges`` a driver
+/// translates into its native write.
 ///
-/// Deliberately the *thin* layer (§2): no type casting ("is this an Int" is
-/// Swift's job, already done at `Codable` decode), no "is this a real field"
-/// checks (keypaths make that a compile error). Only the residual the type
-/// system genuinely cannot cover: formats, lengths, ranges, cross-field
-/// consistency, and dirty tracking.
-///
-/// Every field-referencing method takes a `WritableKeyPath`, never a string
-/// (§4). Keypaths are erased to store-neutral column names (via the model's
-/// `TableModel` metadata) only when building `changes` — the one place
-/// store-agnosticism requires erasure.
+/// A changeset is a **value**. Every method returns a new changeset rather
+/// than mutating in place, so a pipeline reads top to bottom and any
+/// intermediate stage can be held onto, branched from, or passed across an
+/// isolation boundary.
 ///
 /// ```swift
-/// let changeset = Changeset(original: user)          // update; Changeset(User.self) for insert
+/// let changeset = Changeset(original: user)
 ///     .change(\.email, input.email)
+///     .updateChange(\.email) { $0.lowercased() }
 ///     .change(\.displayName, input.displayName)
 ///     .validate(\.email, .email)
 ///     .validate(\.displayName, .length(1...80))
@@ -24,172 +19,303 @@
 /// guard changeset.isValid else { return .failure(changeset.errors) }
 /// try await connection.apply(changeset.validatedChanges(), to: User.self)
 /// ```
+///
+/// ## Deliberately the thin layer
+///
+/// There is no type casting here — "is this an `Int`" is Swift's job and was
+/// already done when the request body decoded. There are no "is this a real
+/// field" checks — keypaths make that a compile error. What remains is the
+/// residual the type system genuinely cannot cover: formats, lengths,
+/// ranges, cross-field consistency, and dirty tracking.
+///
+/// ## Topics
+///
+/// ### Creating a changeset
+/// - ``init(_:)``
+/// - ``init(original:)``
+///
+/// ### Recording changes
+/// - ``forceChange(_:_:)``
+/// - ``deleteChange(_:)``
+/// - ``merge(_:)``
+///
+/// ### Reading values
+/// - ``changed(_:)``
+///
+/// ### Validating
+/// - ``validateRequired(_:)``
+/// - ``validate(_:)``
+/// - ``addError(_:_:)``
+///
+/// ### Finishing
+/// - ``applyChanges()``
+/// - ``validatedChanges()``
 public struct Changeset<Model: TableModel>: Sendable {
-    /// The row being updated, or nil for an insert changeset.
+
+    /// The row being updated, or `nil` for an insert changeset.
+    ///
+    /// ```swift
+    /// Changeset(User.self).original          // nil  — an insert
+    /// Changeset(original: ada).original      // ada  — an update
+    /// ```
     public private(set) var original: Model?
 
-    /// Dirty fields ONLY, keyed by store-neutral column name. A `change`
-    /// whose value equals the original never lands here; one that reverts a
-    /// prior change removes it. Values may box `Optional.none` ("set NULL").
+    /// Dirty fields only, keyed by store-neutral column name.
+    ///
+    /// A `change(_:_:)` whose value equals the original never lands
+    /// here, and one that reverts a prior change removes it — so `changes`
+    /// always means exactly "differs from the original". Values may box
+    /// `Optional.none`, which means *set NULL*, not *no change*.
+    ///
+    /// Prefer ``changed(_:)`` and `getChange(_:)` for reading
+    /// individual fields; they are keypath-based and type-safe. This
+    /// dictionary is the form a driver consumes.
     public private(set) var changes: [String: any Sendable]
 
-    /// Every accumulated validation failure, in the order rules ran.
+    /// Every accumulated validation failure, in the order the rules ran.
+    ///
+    /// Validation never short-circuits: a changeset reports *all* of its
+    /// failures so a form can render every message at once.
     public private(set) var errors: [ChangesetError]
 
+    /// Writers captured at change time, keyed by column name.
+    ///
+    /// ``applyChanges()`` uses these to materialize the result. They are
+    /// captured when a change is recorded rather than read from column
+    /// metadata, which is what lets ``TableColumn`` keep its read-only
+    /// `KeyPath` initializer and still support materialization.
+    internal private(set) var appliers: [String: @Sendable (inout Model) -> Void]
+
+    /// `true` when no validation has failed.
     public var isValid: Bool { errors.isEmpty }
 
-    /// False when nothing differs from the original — callers can skip the
-    /// driver call entirely (drivers also treat empty `changedFields` as a
-    /// no-op; see `InMemoryConnection.apply` for the reference translation).
+    /// `false` when nothing differs from the original.
+    ///
+    /// Callers can skip the driver call entirely; drivers also treat an
+    /// empty ``ValidatedChanges/changedFields`` as a no-op.
+    ///
+    /// ```swift
+    /// guard changeset.hasChanges else { return .noChange }
+    /// ```
     public var hasChanges: Bool { !changes.isEmpty }
 
-    /// An insert changeset: no original, so *every* `change` is dirty and
-    /// `validatedChanges().identity` is nil (§3).
+    // MARK: - Creating a changeset
+
+    /// An insert changeset: no original, so *every* change is dirty and
+    /// ``ValidatedChanges/identity`` is `nil`.
+    ///
+    /// ```swift
+    /// let changeset = Changeset(User.self)
+    ///     .change(\.email, "grace@example.com")
+    ///     .change(\.displayName, "Grace")
+    /// ```
+    ///
+    /// - Precondition: `Model.columns` must not contain two entries with the
+    ///   same ``TableColumn/name``. Duplicate names would silently collide
+    ///   in ``changes``, so they trap here with a message naming the
+    ///   offending column.
     public init(_ type: Model.Type = Model.self) {
+        Model.assertColumnNamesAreUnique()
         self.original = nil
         self.changes = [:]
         self.errors = []
+        self.appliers = [:]
     }
 
     /// An update changeset over `original`: only genuine differences are
     /// tracked, and identity comes from the model's primary-key columns.
+    ///
+    /// ```swift
+    /// let changeset = Changeset(original: ada)
+    ///     .change(\.age, 37)
+    /// changeset.changes            // ["age": 37]
+    /// ```
+    ///
+    /// - Precondition: `Model.columns` must not contain two entries with the
+    ///   same ``TableColumn/name``.
     public init(original: Model) {
+        Model.assertColumnNamesAreUnique()
         self.original = original
         self.changes = [:]
         self.errors = []
+        self.appliers = [:]
     }
 
-    // MARK: - Change accumulation (§4: keypath-based, compile-checked)
+    // MARK: - Recording changes
 
     /// Records that `field` should become `value` — but only if it genuinely
-    /// differs from the original (§6: "only if actually changed"). Setting a
-    /// field back to its original value *removes* any recorded change, so
-    /// `changes` always means exactly "differs from the original". Repeated
-    /// changes to one field: last one wins.
-    public func change<V: Sendable & Equatable>(_ field: WritableKeyPath<Model, V>, _ value: V) -> Changeset {
+    /// differs from the original.
+    ///
+    /// Setting a field back to its original value *removes* the recorded
+    /// change, so a user who edits a field and then undoes the edit produces
+    /// no write for it. Repeated changes to one field: last one wins.
+    ///
+    /// ```swift
+    /// Changeset(original: ada)
+    ///     .change(\.age, 37)
+    ///     .change(\.age, 36)      // ada.age is 36
+    ///     .hasChanges              // false — the edit was undone
+    /// ```
+    ///
+    /// To record a change unconditionally, use ``forceChange(_:_:)``.
+    public func change<V: Sendable & Equatable>(
+        _ field: WritableKeyPath<Model, V> & Sendable, _ value: V
+    ) -> Changeset {
         let name = Model.column(for: field).name
         var next = self
         if let original, original[keyPath: field] == value {
             next.changes.removeValue(forKey: name)
+            next.appliers.removeValue(forKey: name)
         } else {
-            next.changes.updateValue(value, forKey: name)
+            next.record(value, at: name, field: field)
         }
         return next
     }
 
-    /// Non-`Equatable` values cannot be compared against the original, so
-    /// they are always recorded as dirty. Prefer `Equatable` column types —
+    /// Records a change for a value that cannot be compared to the original.
+    ///
+    /// Non-`Equatable` values are always recorded as dirty, because there is
+    /// no way to tell whether they differ. Prefer `Equatable` column types —
     /// they are what makes minimal writes minimal.
-    public func change<V: Sendable>(_ field: WritableKeyPath<Model, V>, _ value: V) -> Changeset {
+    public func change<V: Sendable>(
+        _ field: WritableKeyPath<Model, V> & Sendable, _ value: V
+    ) -> Changeset {
+        var next = self
+        next.record(value, at: Model.column(for: field).name, field: field)
+        return next
+    }
+
+    /// Records `value` for `field` even when it equals the original.
+    ///
+    /// The escape hatch from dirty tracking. Use it when a column must be
+    /// written regardless of whether the user changed anything — a
+    /// `updated_at` stamp, a revision counter, a re-issued token.
+    ///
+    /// ```swift
+    /// changeset
+    ///     .change(\.displayName, input.name)   // may be a no-op
+    ///     .forceChange(\.updatedAt, .now)      // always written
+    /// ```
+    public func forceChange<V: Sendable>(
+        _ field: WritableKeyPath<Model, V> & Sendable, _ value: V
+    ) -> Changeset {
+        var next = self
+        next.record(value, at: Model.column(for: field).name, field: field)
+        return next
+    }
+
+    /// Transforms the recorded change for `field`, if there is one.
+    ///
+    /// A field with no recorded change is left alone — `transform` is not
+    /// called and no change is created. This is the normalization hook:
+    /// lowercase an email, trim whitespace, hash a password, round a price.
+    ///
+    /// ```swift
+    /// Changeset(User.self)
+    ///     .change(\.email, "  Ada@Example.COM ")
+    ///     .updateChange(\.email) { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+    ///     .getChange(\.email)          // "ada@example.com"
+    /// ```
+    ///
+    /// Because it runs *before* validation in a normal pipeline, a rule that
+    /// follows sees the normalized value.
+    public func updateChange<V: Sendable>(
+        _ field: WritableKeyPath<Model, V> & Sendable, _ transform: (V) -> V
+    ) -> Changeset {
+        let name = Model.column(for: field).name
+        guard let recorded = changes[name], let typed = recorded as? V else {
+            return self
+        }
+        var next = self
+        next.record(transform(typed), at: name, field: field)
+        return next
+    }
+
+    /// Optional-field overload of `updateChange(_:_:)`.
+    ///
+    /// The transform sees the *wrapped* value, so you write
+    /// `{ $0.lowercased() }` rather than unwrapping by hand. A field that
+    /// was changed to `nil`, or not changed at all, is left alone.
+    ///
+    /// ```swift
+    /// Changeset(User.self)
+    ///     .change(\.email, "  Ada@Example.COM ")     // email is String?
+    ///     .updateChange(\.email) { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+    ///     .getChange(\.email)                         // "ada@example.com"
+    /// ```
+    public func updateChange<V: Sendable>(
+        _ field: WritableKeyPath<Model, V?> & Sendable, _ transform: (V) -> V
+    ) -> Changeset {
+        let name = Model.column(for: field).name
+        guard let recorded = changes[name], let typed = recorded as? V else {
+            return self
+        }
+        var next = self
+        next.record(V?.some(transform(typed)), at: name, field: field)
+        return next
+    }
+
+    /// Removes any recorded change for `field`.
+    ///
+    /// The field reverts to reading as the original's value. Use it to drop
+    /// a field a caller is not permitted to write, or to discard a change
+    /// after deciding it is redundant.
+    ///
+    /// ```swift
+    /// changeset.deleteChange(\.role)      // never let the client set this
+    /// ```
+    public func deleteChange<V>(_ field: KeyPath<Model, V>) -> Changeset {
         let name = Model.column(for: field).name
         var next = self
-        next.changes.updateValue(value, forKey: name)
+        next.changes.removeValue(forKey: name)
+        next.appliers.removeValue(forKey: name)
         return next
     }
 
-    // MARK: - Effective values
-
-    /// The value `field` would have if this changeset were applied: the
-    /// recorded change if there is one, else the original's value, else nil
-    /// (insert changeset, field untouched). This is what validation rules
-    /// and cross-field checks read.
-    public func value<V>(_ field: KeyPath<Model, V>) -> V? {
-        let name = Model.column(for: field).name
-        if let recorded = changes[name] {
-            return recorded as? V
-        }
-        return original?[keyPath: field]
-    }
-
-    /// Optional-field overload, flattened: a recorded "set to nil", an
-    /// original nil, and an untouched insert field all read as nil.
-    public func value<V>(_ field: KeyPath<Model, V?>) -> V? {
-        let name = Model.column(for: field).name
-        if let recorded = changes[name] {
-            return recorded as? V
-        }
-        return original.flatMap { $0[keyPath: field] }
-    }
-
-    // MARK: - Validation (accumulates, never throws mid-chain)
-
-    /// Fails unless the *effective* value of `field` is non-nil. Only
-    /// optional fields can be required — a non-optional field is guaranteed
-    /// present by construction, and referencing it here is a compile error
-    /// (§2: the type system's half of the job stays with the type system).
-    public func validateRequired<V>(_ field: WritableKeyPath<Model, V?>) -> Changeset {
-        let name = Model.column(for: field).name
-        if value(field) == nil {
-            return appending(ChangesetError(field: name, message: "is required"))
-        }
-        return self
-    }
-
-    /// Applies `rule` to `field`'s *recorded change*. A field with no
-    /// recorded change is not validated — unchanged data came from the
-    /// store and was validated when it was written (Ecto's semantics).
-    /// Nil-ness is `validateRequired`'s job, not a rule's.
-    public func validate<V>(_ field: WritableKeyPath<Model, V>, _ rule: ValidationRule<V>) -> Changeset {
-        applyRule(rule, toChangeAt: Model.column(for: field).name)
-    }
-
-    /// Optional-field overload: the rule sees the wrapped value; a change
-    /// that sets the field to nil is skipped (pair with `validateRequired`
-    /// when nil must be rejected).
-    public func validate<V>(_ field: WritableKeyPath<Model, V?>, _ rule: ValidationRule<V>) -> Changeset {
-        applyRule(rule, toChangeAt: Model.column(for: field).name)
-    }
-
-    /// Applies a cross-field rule (§3) against the changeset's *effective*
-    /// state. Cross-field rules always run — a consistency property must
-    /// hold over the whole row, whichever side of it changed.
-    public func validate(_ rule: CrossFieldRule<Model>) -> Changeset {
-        if let message = rule.check(self) {
-            return appending(ChangesetError(field: rule.field, message: message))
-        }
-        return self
-    }
-
-    // MARK: - The driver handoff (§3, §5)
-
-    /// The neutral handoff to a driver. Throws `ChangesetValidationError`
-    /// if `!isValid`, so an invalid changeset can NEVER reach a driver —
-    /// validation failure is caught at this boundary, structurally.
+    /// Combines `other` into this changeset.
     ///
-    /// For update changesets, `identity` is read from the original's
-    /// primary-key columns; a `TableModel` with no primary key cannot
-    /// address a row and traps (metadata bug, not a runtime condition).
-    public func validatedChanges() throws -> ValidatedChanges {
-        guard errors.isEmpty else {
-            throw ChangesetValidationError(errors: errors)
-        }
-        let identity: [String: any Sendable]?
-        if let original {
-            let primaryKey = Model.primaryKey
-            precondition(!primaryKey.isEmpty, """
-            \(Model.self) has no primary-key column, so an update changeset cannot address its row. \
-            Flag identity columns with TableColumn(_, _, primaryKey: true).
-            """)
-            identity = Dictionary(uniqueKeysWithValues: primaryKey.map { ($0.name, $0.read(original)) })
-        } else {
-            identity = nil
-        }
-        return ValidatedChanges(changedFields: changes, identity: identity)
+    /// Changes and errors from `other` are layered on top of this one:
+    /// where both record the same field, `other` wins; errors from both are
+    /// kept, this changeset's first. Use it to assemble one changeset from
+    /// several independently-built pieces — a base changeset plus a
+    /// role-specific one, say.
+    ///
+    /// ```swift
+    /// let full = baseChangeset.merge(adminOnlyChangeset)
+    /// ```
+    ///
+    /// - Precondition: both changesets must describe the same row — either
+    ///   both inserts, or both updates whose originals are the same value.
+    ///   Merging an insert with an update, or two different rows, is a
+    ///   programmer error and traps.
+    public func merge(_ other: Changeset) -> Changeset {
+        precondition(
+            (original == nil) == (other.original == nil),
+            """
+            Cannot merge an insert changeset with an update changeset for \
+            \(Model.self). Both sides must describe the same row.
+            """
+        )
+        var next = self
+        next.changes.merge(other.changes) { _, incoming in incoming }
+        next.appliers.merge(other.appliers) { _, incoming in incoming }
+        next.errors.append(contentsOf: other.errors)
+        return next
     }
 
     // MARK: - Internals
 
-    private func applyRule<V>(_ rule: ValidationRule<V>, toChangeAt name: String) -> Changeset {
-        guard let recorded = changes[name], let value = recorded as? V else {
-            return self
-        }
-        if let message = rule.run(value) {
-            return appending(ChangesetError(field: name, message: message))
-        }
-        return self
+    /// Stores a value and the writer that will materialize it.
+    private mutating func record<V: Sendable>(
+        _ value: V, at name: String, field: WritableKeyPath<Model, V> & Sendable
+    ) {
+        changes.updateValue(value, forKey: name)
+        appliers.updateValue({ model in model[keyPath: field] = value }, forKey: name)
     }
 
-    private func appending(_ error: ChangesetError) -> Changeset {
+    /// Appends an error. Internal so the only public paths are the
+    /// validation methods and ``addError(_:_:)``.
+    internal func appending(_ error: ChangesetError) -> Changeset {
         var next = self
         next.errors.append(error)
         return next

@@ -70,3 +70,30 @@ struct Document: TableModel {
         TableColumn("payload", \Document.payload),
     ]
 }
+
+/// Exercises `.accepted`, `.confirms`, `.subset`, `.excluding` and
+/// `forceChange` — the shapes a signup form actually has.
+struct Signup: TableModel, Equatable {
+    var id: Int?
+    var handle: String
+    var password: String
+    var passwordConfirmation: String
+    var acceptedTerms: Bool
+    var tags: [String]
+    var updatedAt: Int
+
+    static let columns: [TableColumn<Signup>] = [
+        TableColumn("id", \Signup.id, primaryKey: true),
+        TableColumn("handle", \Signup.handle),
+        TableColumn("password", \Signup.password),
+        TableColumn("password_confirmation", \Signup.passwordConfirmation),
+        TableColumn("accepted_terms", \Signup.acceptedTerms),
+        TableColumn("tags", \Signup.tags),
+        TableColumn("updated_at", \Signup.updatedAt),
+    ]
+
+    static let blank = Signup(
+        id: nil, handle: "", password: "", passwordConfirmation: "",
+        acceptedTerms: false, tags: [], updatedAt: 0
+    )
+}

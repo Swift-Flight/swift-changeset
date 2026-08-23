@@ -1,18 +1,16 @@
-/// The store-agnostic model-metadata seam the changeset consumes (changeset
-/// design §4): which stored properties are columns, what each is named at
-/// the store, and which of them identify a row.
+/// The store-agnostic model-metadata seam a changeset consumes: which
+/// stored properties are columns, what each is named at the store, and
+/// which of them identify a row.
 ///
-/// The changeset needs exactly one thing from a model type: a mapping from
-/// *keypaths* (the compile-checked, developer-facing currency) to *column
-/// identifiers* (the store-neutral strings inside `ValidatedChanges`). This
-/// protocol is that mapping and nothing else — deliberately not a query
-/// model (Flight Data Core §1) and deliberately not StructuredQueries'
-/// `Table`: that library is the Postgres driver's choice (its design §3.2),
-/// and this seam must serve a Mongo or Redis driver identically. The
-/// Postgres package bridges its `@Table` metadata onto this protocol
-/// mechanically; hand-conformance is a handful of lines (see
-/// `TableColumn`). A `@TableModel` macro generating the conformance is
-/// deliberate future sugar, not a dependency of the design.
+/// A changeset needs exactly one thing from a model type: a mapping from
+/// *keypaths* — the compile-checked, developer-facing currency — to *column
+/// identifiers*, the store-neutral strings inside ``ValidatedChanges``.
+/// This protocol is that mapping and nothing else. It is deliberately not a
+/// query model: the same conformance has to serve a SQL driver, a document
+/// store, and a key-value store identically.
+///
+/// Conforming by hand is a handful of lines, and a code generator can emit
+/// the same shape mechanically.
 ///
 /// ```swift
 /// struct User: TableModel {
@@ -51,19 +49,60 @@ extension TableModel {
         columns.filter(\.isPrimaryKey)
     }
 
-    /// The store-neutral column name for `keyPath`, or nil when no column
-    /// metadata covers it. The non-trapping public face of `column(for:)`,
-    /// for consumers that resolve keypaths to column identifiers outside a
-    /// changeset — e.g. Hangar's association preloading, which turns a
-    /// foreign-key keypath into the column its batched query filters on.
+    /// The store-neutral column name for `keyPath`, or `nil` when no column
+    /// metadata covers it.
+    ///
+    /// The non-trapping counterpart to the changeset's internal lookup, for
+    /// code that resolves keypaths to column identifiers outside a
+    /// changeset — turning a foreign-key keypath into the column a query
+    /// filters on, for instance.
+    ///
+    /// ```swift
+    /// User.columnName(for: \User.displayName)   // "display_name"
+    /// ```
     public static func columnName(for keyPath: AnyKeyPath) -> String? {
         columns.first(where: { $0.keyPath == keyPath })?.name
     }
 
     /// Keypath → column lookup. Trapping, not throwing: a missing entry is
-    /// incomplete metadata (a wiring bug caught by any test that touches the
-    /// field), not a runtime condition — the same reasoning as Core's
-    /// registration preconditions (Flight Core §2.1).
+    /// incomplete metadata — a wiring bug caught by any test that touches
+    /// the field — not a runtime condition callers can recover from.
+    /// Traps when two columns share a ``TableColumn/name``.
+    ///
+    /// Duplicate names are silent data corruption: ``Changeset/changes`` is
+    /// keyed by name, so the second column's write overwrites the first's
+    /// and reads come back from the wrong field. Checking at changeset
+    /// construction turns that into a loud failure at the first test that
+    /// touches the model.
+    internal static func assertColumnNamesAreUnique() {
+        var seen = Set<String>()
+        seen.reserveCapacity(columns.count)
+        for column in columns where !seen.insert(column.name).inserted {
+            preconditionFailure("""
+            \(Self.self) declares more than one column named "\(column.name)". \
+            Column names key the changeset's changes, so duplicates would silently \
+            drop one field's write and read back the other's value. \
+            Give each TableColumn in \(Self.self).columns a distinct name.
+            """)
+        }
+    }
+
+    /// Checks this model's column metadata and traps on a problem.
+    ///
+    /// Call it from a test to catch metadata mistakes at their source rather
+    /// than at the first changeset that happens to touch the field.
+    ///
+    /// ```swift
+    /// @Test func metadataIsWellFormed() {
+    ///     User.validateColumnMetadata()
+    /// }
+    /// ```
+    ///
+    /// - Precondition: no two columns share a name.
+    public static func validateColumnMetadata() {
+        assertColumnNamesAreUnique()
+    }
+
     internal static func column(for keyPath: AnyKeyPath) -> TableColumn<Self> {
         guard let column = columns.first(where: { $0.keyPath == keyPath }) else {
             preconditionFailure("""
