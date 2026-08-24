@@ -71,6 +71,14 @@ column written regardless — a timestamp, a revision counter — reach for
 - ``TableColumn``
 - ``ValidatedChanges``
 
+### Nesting and locking
+
+- ``Changeset/nest(_:_:)-(_,[Changeset<Child>])``
+- ``NestedChangeset``
+- ``Changeset/optimisticLock(_:)``
+- ``ChangesetLock``
+- ``ChangesetConflictError``
+
 ### Validation
 
 - ``ValidationRule``

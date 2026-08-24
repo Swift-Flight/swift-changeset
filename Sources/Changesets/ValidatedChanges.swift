@@ -21,9 +21,31 @@ public struct ValidatedChanges: Sendable {
     /// apart without a separate flag.
     public let identity: [String: any Sendable]?
 
-    public init(changedFields: [String: any Sendable], identity: [String: any Sendable]?) {
+    /// The optimistic lock in force, or `nil`.
+    ///
+    /// Purely informational: the lock's column is *already* present in both
+    /// ``changedFields`` and ``identity``, so a driver that ignores this
+    /// property still emits the correct `SET`/`WHERE`. It is here so a
+    /// driver that matched zero rows can say *why* — raising
+    /// ``ChangesetConflictError`` instead of reporting a bare row count.
+    ///
+    /// ```swift
+    /// let rows = try await connection.update(validated)
+    /// if rows == 0, let lock = validated.lock {
+    ///     throw ChangesetConflictError(
+    ///         table: table, field: lock.field, expected: String(describing: lock.expected))
+    /// }
+    /// ```
+    public let lock: ChangesetLock?
+
+    public init(
+        changedFields: [String: any Sendable],
+        identity: [String: any Sendable]?,
+        lock: ChangesetLock? = nil
+    ) {
         self.changedFields = changedFields
         self.identity = identity
+        self.lock = lock
     }
 }
 

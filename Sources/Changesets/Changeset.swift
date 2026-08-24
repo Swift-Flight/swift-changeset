@@ -72,11 +72,42 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// dictionary is the form a driver consumes.
     public private(set) var changes: [String: any Sendable]
 
-    /// Every accumulated validation failure, in the order the rules ran.
+    /// This changeset's own validation failures, excluding any contributed
+    /// by nested children.
+    ///
+    /// Almost every caller wants ``errors`` instead — it is this list plus
+    /// the children's, which is what a form renders. Reach for `ownErrors`
+    /// only to answer "did the *parent* fail, or just a child?".
+    public internal(set) var ownErrors: [ChangesetError]
+
+    /// Nested child changesets, in the order they were attached.
+    ///
+    /// Populated by ``nest(_:_:)-(_,[Changeset<Child>])``. Their errors
+    /// appear in ``errors`` under a path like `addresses[0].zip`, and their
+    /// writes are read back with ``validatedNestedChanges()``.
+    public internal(set) var nestedChangesets: [NestedChangeset]
+
+    /// Optimistic-lock state, set by ``optimisticLock(_:)``.
+    ///
+    /// `nil` unless a lock was requested. When present, the lock column is
+    /// merged into both ``ValidatedChanges/changedFields`` (the incremented
+    /// value) and ``ValidatedChanges/identity`` (the value read from the
+    /// original), so a driver that knows nothing about locking still writes
+    /// the right SQL.
+    public internal(set) var lock: ChangesetLock?
+
+    /// Every accumulated validation failure, in the order the rules ran —
+    /// this changeset's own, followed by its children's.
     ///
     /// Validation never short-circuits: a changeset reports *all* of its
-    /// failures so a form can render every message at once.
-    public private(set) var errors: [ChangesetError]
+    /// failures so a form can render every message at once. A nested
+    /// child's failures arrive with their field names prefixed by the
+    /// association path (`addresses[0].zip`), which is exactly the key a
+    /// nested form renders against.
+    public var errors: [ChangesetError] {
+        guard !nestedChangesets.isEmpty else { return ownErrors }
+        return ownErrors + nestedChangesets.flatMap(\.pathedErrors)
+    }
 
     /// Writers captured at change time, keyed by column name.
     ///
@@ -89,7 +120,8 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// `true` when no validation has failed.
     public var isValid: Bool { errors.isEmpty }
 
-    /// `false` when nothing differs from the original.
+    /// `false` when nothing differs from the original, here or in any
+    /// nested child.
     ///
     /// Callers can skip the driver call entirely; drivers also treat an
     /// empty ``ValidatedChanges/changedFields`` as a no-op.
@@ -97,7 +129,9 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// ```swift
     /// guard changeset.hasChanges else { return .noChange }
     /// ```
-    public var hasChanges: Bool { !changes.isEmpty }
+    public var hasChanges: Bool {
+        !changes.isEmpty || nestedChangesets.contains(where: \.hasChanges)
+    }
 
     // MARK: - Creating a changeset
 
@@ -118,8 +152,9 @@ public struct Changeset<Model: TableModel>: Sendable {
         Model.assertColumnNamesAreUnique()
         self.original = nil
         self.changes = [:]
-        self.errors = []
+        self.ownErrors = []
         self.appliers = [:]
+        self.nestedChangesets = []
     }
 
     /// An update changeset over `original`: only genuine differences are
@@ -137,8 +172,9 @@ public struct Changeset<Model: TableModel>: Sendable {
         Model.assertColumnNamesAreUnique()
         self.original = original
         self.changes = [:]
-        self.errors = []
+        self.ownErrors = []
         self.appliers = [:]
+        self.nestedChangesets = []
     }
 
     // MARK: - Recording changes
@@ -299,7 +335,14 @@ public struct Changeset<Model: TableModel>: Sendable {
         var next = self
         next.changes.merge(other.changes) { _, incoming in incoming }
         next.appliers.merge(other.appliers) { _, incoming in incoming }
-        next.errors.append(contentsOf: other.errors)
+        next.ownErrors.append(contentsOf: other.ownErrors)
+        for child in other.nestedChangesets {
+            next.nestedChangesets.removeAll {
+                $0.association == child.association && $0.index == child.index
+            }
+            next.nestedChangesets.append(child)
+        }
+        if let incoming = other.lock { next.lock = incoming }
         return next
     }
 
@@ -317,7 +360,7 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// validation methods and ``addError(_:_:)``.
     internal func appending(_ error: ChangesetError) -> Changeset {
         var next = self
-        next.errors.append(error)
+        next.ownErrors.append(error)
         return next
     }
 }

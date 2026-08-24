@@ -115,7 +115,8 @@ extension Changeset {
     /// boundary is structural, not a convention.
     ///
     /// For update changesets, ``ValidatedChanges/identity`` is read from the
-    /// original's primary-key columns.
+    /// original's primary-key columns — plus the version column, if
+    /// ``optimisticLock(_:)`` was applied.
     ///
     /// ```swift
     /// let validated = try changeset.validatedChanges()
@@ -123,8 +124,12 @@ extension Changeset {
     /// validated.identity           // ["id": 1]  — nil for an insert
     /// ```
     ///
+    /// A changeset with nested children is invalid while any child is, so
+    /// this refuses a parent whose children have not validated. The
+    /// children's own handoffs come from ``validatedNestedChanges()``.
+    ///
     /// - Throws: ``ChangesetValidationError`` carrying every accumulated
-    ///   error.
+    ///   error, this changeset's and its children's.
     /// - Precondition: an update changeset's model must declare at least one
     ///   primary-key column; without one there is no way to address the row.
     public func validatedChanges() throws -> ValidatedChanges {
@@ -138,11 +143,13 @@ extension Changeset {
             \(Model.self) has no primary-key column, so an update changeset cannot address its row. \
             Flag identity columns with TableColumn(_, _, primaryKey: true).
             """)
-            identity = Dictionary(uniqueKeysWithValues: primaryKey.map { ($0.name, $0.read(original)) })
+            var keys = Dictionary(uniqueKeysWithValues: primaryKey.map { ($0.name, $0.read(original)) })
+            if let lock { keys[lock.field] = lock.expected }
+            identity = keys
         } else {
             identity = nil
         }
-        return ValidatedChanges(changedFields: changes, identity: identity)
+        return ValidatedChanges(changedFields: changes, identity: identity, lock: lock)
     }
 
     // MARK: - Internals

@@ -164,15 +164,81 @@ let preview = changeset.applyChanges()          // User?
 let draft = changeset.applyChanges(to: .blank)  // for insert changesets
 ```
 
+## Nested changesets
+
+A parent and its children validate as one unit. `nest` attaches child
+changesets under an association name; the parent is invalid while any child
+is, and the children's errors arrive under the path a nested form renders
+against.
+
+```swift
+let order = Changeset(Order.self)
+    .change(\.customerID, customerID)
+    .nest("lineItems", input.lines.map { line in
+        Changeset(LineItem.self)
+            .change(\.sku, line.sku)
+            .change(\.quantity, line.quantity)
+            .validate(\.quantity, .range(1..., message: "must be at least 1"))
+    })
+
+order.isValid              // false if any line has quantity 0
+order.messagesByField      // ["lineItems[2].quantity": ["must be at least 1"]]
+```
+
+Nesting deliberately does not write anything, and does not decide write
+order. For an insert the parent has to land first — the children usually
+need its generated key — so the two handoffs are two calls:
+
+```swift
+let parent = try order.validatedChanges()
+let orderID = try await repo.insert(parent)
+for row in try order.validatedNestedChanges()["lineItems"] ?? [] {
+    try await repo.insert(row, parentID: orderID)
+}
+```
+
+A to-one association nests the same way and drops the index from the path:
+`.nest("address", addressChangeset)` reports `address.zip`. Attaching the
+same association twice replaces the previous children, so rebuilding from
+fresh form input is idempotent.
+
+## Optimistic locking
+
+Two users load the same row, both edit, both save. Without a lock the second
+write silently discards the first. `optimisticLock` makes that loud:
+
+```swift
+let changeset = Changeset(original: post)      // post.version == 7
+    .change(\.title, "Revised")
+    .optimisticLock(\.version)
+
+let validated = try changeset.validatedChanges()
+validated.changedFields    // ["title": "Revised", "version": 8]
+validated.identity         // ["id": 1, "version": 7]
+```
+
+The version column joins the `SET` with its new value and the `WHERE` with
+the value the changeset read. If another writer got there first the update
+matches no row, and the driver reports a conflict instead of a lost update.
+
+A driver needs no special support for this — the merge into `changedFields`
+and `identity` is the whole mechanism. `ValidatedChanges.lock` is there for a
+driver that would rather raise `ChangesetConflictError` than report "0 rows
+updated":
+
+```swift
+if rows == 0, let lock = validated.lock {
+    throw ChangesetConflictError(
+        table: Post.tableName, field: lock.field,
+        expected: String(describing: lock.expected))
+}
+```
+
 ## What this library is not
 
 It does not cast types — `Codable` already did that when your request body
 decoded. It does not check that a field exists — keypaths make that a compile
 error. It does not talk to a database, build queries, or run migrations.
-
-Also not included, deliberately: nested and embedded changesets (validating a
-parent and its children as one unit), and optimistic locking. If you need
-either, this is not yet the library for you.
 
 ## Documentation
 
