@@ -22,7 +22,9 @@ public struct ChangesetLock: Sendable {
     /// must still find.
     public let expected: any Sendable
 
-    /// The version the write installs: `expected` plus one.
+    /// The version the write installs: `expected` plus one — or whatever
+    /// later edit to the lock column replaced it, since a lock always
+    /// describes the write actually recorded.
     public let next: any Sendable
 
     public init(field: String, expected: any Sendable, next: any Sendable) {
@@ -75,6 +77,12 @@ extension Changeset {
     /// Guards this update against a concurrent write, using an integer
     /// version column.
     ///
+    /// Integer versions only. A `FixedWidthInteger` column is what the
+    /// increment is defined over; UUID tokens and timestamp locks would each
+    /// need their own "what comes next" rule, and neither has a single
+    /// obvious answer. Either can still be locked by hand — the mechanism is
+    /// nothing more than a forced change plus the old value in identity.
+    ///
     /// Records `field = original + 1` as a change *and* pins the original's
     /// value into ``ValidatedChanges/identity``, so the resulting write is
     /// `SET version = 8 WHERE id = 1 AND version = 7`. If another writer
@@ -100,15 +108,22 @@ extension Changeset {
     /// lock against, and the row's starting version comes from its column
     /// default or from an explicit `change(\.version, 1)`.
     ///
-    /// Calling it twice, or after changing the version by hand, leaves the
-    /// last lock in force.
+    /// Calling it twice leaves the last lock in force. Editing the version
+    /// column *after* locking — `change`, `forceChange`, or `updateChange` —
+    /// keeps the lock but re-points ``ChangesetLock/next`` at the value the
+    /// write will actually install, so a driver reporting a conflict never
+    /// reports a version the write did not use. Dropping that change
+    /// entirely, with ``deleteChange(_:)`` or by reverting the field to the
+    /// original's value, clears the lock: a guard on a version the write
+    /// never advances stops the *next* stale writer from being noticed,
+    /// which is worse than no lock at all.
     ///
     /// - Note: The increment wraps rather than traps at the version type's
     ///   maximum. Reaching `Int32.max` takes two billion updates to one row;
     ///   trapping there would turn a survivable curiosity into a crash.
     /// - Precondition: `field` must not also be a primary-key column — the
     ///   two would collide in ``ValidatedChanges/identity``.
-    public func optimisticLock<V: FixedWidthInteger & Sendable>(
+    public consuming func optimisticLock<V: FixedWidthInteger & Sendable>(
         _ field: WritableKeyPath<Model, V> & Sendable
     ) -> Changeset {
         guard let original else { return self }

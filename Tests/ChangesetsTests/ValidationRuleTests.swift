@@ -33,6 +33,26 @@ struct ValidationRuleTests {
         }
     }
 
+    @Test("email: the hand-rolled scan accepts exactly what the regex shape accepted")
+    func emailMatchesItsDocumentedShape() {
+        // `.email` is scanned by hand for speed; this pins it to the shape
+        // its documentation still promises, over the cases that separate
+        // the two: dots, multiple @s, empty labels, trailing whitespace.
+        let regexShaped = ValidationRule<String>
+            .matches(#"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, message: "x")
+        let corpus = [
+            "", "@", "a@b.c", "a@b", "a@.b", "a@b.", ".a@b.c", "a.@b.c",
+            "a@b..c", "a@b.c.d", "a@@b.c", "a@b@c.d", "a b@c.d", "a@b c.d",
+            "a@b.c ", " a@b.c", "a@b.c\n", "a\tb@c.d", "ünïcode@exämple.dev",
+            "a+tag@sub.domain.dev", "a@b.c.d.e", "..@..", "a@b.c.",
+        ]
+        for value in corpus {
+            let hand = errors(value, \.displayName, .email).isEmpty
+            let regex = errors(value, \.displayName, regexShaped).isEmpty
+            #expect(hand == regex, "disagreement on '\(value)': hand \(hand), regex \(regex)")
+        }
+    }
+
     @Test("length: closed, from, and through ranges with readable defaults")
     func length() {
         #expect(errors("Ada", \.displayName, .length(1...80)).isEmpty)

@@ -73,6 +73,16 @@ changeset.getChange(\.email)     // "grace@example.com"
 changeset.isValid                 // true
 ```
 
+When the normalization can *fail* — parsing a phone number, canonicalizing a
+URL — ``Changeset/updateChange(_:orError:_:)`` takes a transform that may
+return `nil`, and records the message you give it when it does:
+
+```swift
+Changeset(User.self)
+    .change(\.phone, input.phone)
+    .updateChange(\.phone, orError: "is not a valid phone number") { E164.normalize($0) }
+```
+
 ## Validate
 
 Rules accumulate. Nothing short-circuits, so one pass reports every problem:
@@ -101,9 +111,13 @@ write — and refuses to produce one at all if the changeset is invalid:
 ```swift
 let validated = try changeset.validatedChanges()
 
+validated.tableName       // "users"
 validated.changedFields   // ["display_name": "Ada Lovelace"]
 validated.identity        // ["id": 1]   — nil for an insert
 ```
+
+It names its own table, so a driver call takes one argument rather than a
+value and the table its caller had to remember to pass alongside.
 
 That `identity`/`nil` distinction is how a driver knows whether it is
 writing an `UPDATE ... WHERE id = 1` or an `INSERT`.

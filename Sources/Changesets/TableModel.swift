@@ -64,16 +64,27 @@ extension TableModel {
         columns.first(where: { $0.keyPath == keyPath })?.name
     }
 
-    /// Keypath → column lookup. Trapping, not throwing: a missing entry is
-    /// incomplete metadata — a wiring bug caught by any test that touches
-    /// the field — not a runtime condition callers can recover from.
-    /// Traps when two columns share a ``TableColumn/name``.
+    /// The per-changeset column-name check, in debug builds only.
     ///
     /// Duplicate names are silent data corruption: ``Changeset/changes`` is
     /// keyed by name, so the second column's write overwrites the first's
     /// and reads come back from the wrong field. Checking at changeset
     /// construction turns that into a loud failure at the first test that
     /// touches the model.
+    ///
+    /// It verifies a property of the *type*, which cannot change at
+    /// runtime — so a release build, where a handler may construct
+    /// thousands of changesets a second, re-proves nothing and pays a `Set`
+    /// allocation for it. Debug is where the first test run lives, and
+    /// ``validateColumnMetadata()`` is the unconditional form for a test
+    /// that wants the check in any configuration.
+    internal static func assertColumnNamesAreUniqueWhenDebugging() {
+        #if DEBUG
+        assertColumnNamesAreUnique()
+        #endif
+    }
+
+    /// Traps when two columns share a ``TableColumn/name``.
     internal static func assertColumnNamesAreUnique() {
         var seen = Set<String>()
         seen.reserveCapacity(columns.count)
@@ -98,11 +109,27 @@ extension TableModel {
     /// }
     /// ```
     ///
+    /// Changeset construction runs the same check, but only in debug
+    /// builds; this one always runs.
+    ///
     /// - Precondition: no two columns share a name.
     public static func validateColumnMetadata() {
         assertColumnNamesAreUnique()
     }
 
+    /// Keypath → column lookup. Trapping, not throwing: a missing entry is
+    /// incomplete metadata — a wiring bug caught by any test that touches
+    /// the field — not a runtime condition callers can recover from.
+    ///
+    /// - Note: A linear scan comparing keypaths, and the hottest lookup in
+    ///   the library — every `change`, `validate`, and `value` pays one.
+    ///   `AnyKeyPath` equality is a component walk rather than a pointer
+    ///   compare, so the cost is O(fields × columns) per changeset. That is
+    ///   the deliberate minimalist trade: models have tens of columns, not
+    ///   thousands, and a static `[AnyKeyPath: TableColumn]` cache would
+    ///   need per-type storage the protocol cannot declare. If a profile
+    ///   ever says otherwise, that cache is the fix — `AnyKeyPath` is
+    ///   `Hashable`.
     internal static func column(for keyPath: AnyKeyPath) -> TableColumn<Self> {
         guard let column = columns.first(where: { $0.keyPath == keyPath }) else {
             preconditionFailure("""

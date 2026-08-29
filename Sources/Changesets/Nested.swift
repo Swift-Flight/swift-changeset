@@ -104,25 +104,27 @@ extension Changeset {
     ///         Changeset(LineItem.self)
     ///             .change(\.sku, line.sku)
     ///             .change(\.quantity, line.quantity)
-    ///             .validate(\.quantity, .greaterThan(0))
+    ///             .validate(\.quantity, .range(1..., message: "must be at least 1"))
     ///     })
     ///
     /// order.isValid                 // false if any line has quantity 0
-    /// order.messagesByField         // ["lineItems[2].quantity": ["must be greater than 0"]]
+    /// order.messagesByField         // ["lineItems[2].quantity": ["must be at least 1"]]
     /// ```
     ///
     /// Attaching the same `association` twice replaces the previous
     /// children rather than appending to them, so rebuilding a form's
-    /// children from fresh input is idempotent.
+    /// children from fresh input is idempotent. ``merge(_:)`` replaces at
+    /// the same granularity, for the same reason: a superseded submission
+    /// must not leave its extra rows behind.
     ///
     /// - Note: This does not decide write order. For inserts a driver must
     ///   write the parent first — the children usually need its generated
     ///   key — which is why ``validatedChanges()`` and
     ///   ``validatedNestedChanges()`` are separate calls rather than one.
-    public func nest<Child: TableModel>(
+    public consuming func nest<Child: TableModel>(
         _ association: String, _ children: [Changeset<Child>]
     ) -> Changeset {
-        var next = self
+        var next = consume self
         next.nestedChangesets.removeAll { $0.association == association }
         next.nestedChangesets.append(
             contentsOf: children.enumerated().map { index, child in
@@ -135,17 +137,19 @@ extension Changeset {
     /// Attaches a to-one association's changeset.
     ///
     /// The same contract as the to-many overload, with unindexed error
-    /// paths: a failure on the child's `bio` reads as `profile.bio`.
+    /// paths: a failure on the child's `bio` reads as `profile.bio`. An
+    /// association is to-one or to-many, never both: nesting either way
+    /// replaces whatever the association held before.
     ///
     /// ```swift
     /// let user = Changeset(original: ada)
     ///     .change(\.displayName, "Ada L.")
     ///     .nest("profile", Changeset(original: adasProfile).change(\.bio, bio))
     /// ```
-    public func nest<Child: TableModel>(
+    public consuming func nest<Child: TableModel>(
         _ association: String, _ child: Changeset<Child>
     ) -> Changeset {
-        var next = self
+        var next = consume self
         next.nestedChangesets.removeAll { $0.association == association }
         next.nestedChangesets.append(
             NestedChangeset(association: association, index: nil, changeset: child)
@@ -154,8 +158,8 @@ extension Changeset {
     }
 
     /// Removes an association's children.
-    public func removeNested(_ association: String) -> Changeset {
-        var next = self
+    public consuming func removeNested(_ association: String) -> Changeset {
+        var next = consume self
         next.nestedChangesets.removeAll { $0.association == association }
         return next
     }

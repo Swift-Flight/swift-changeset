@@ -13,10 +13,43 @@ extension Changeset {
     ///     .validateRequired(\.email)      // email is String?
     ///     .errors                          // [email: is required]
     /// ```
-    public func validateRequired<V>(_ field: WritableKeyPath<Model, V?>) -> Changeset {
+    public consuming func validateRequired<V>(_ field: WritableKeyPath<Model, V?>) -> Changeset {
         let name = Model.column(for: field).name
         if value(field) == nil {
             return appending(ChangesetError(field: name, message: "is required"))
+        }
+        return self
+    }
+
+    /// Fails when `field` carries no value into the write and there is no
+    /// original to supply one.
+    ///
+    /// The insert-side companion to ``validateRequired(_:)``. A
+    /// non-optional field cannot be "missing" once a row exists, so
+    /// `validateRequired` correctly refuses to accept one — but on an
+    /// *insert* an untouched non-optional field is simply absent from the
+    /// write, and the first thing to notice is the store's `NOT NULL`
+    /// error. This rule says "this insert must name `display_name`" in the
+    /// changeset, where the message can reach the form.
+    ///
+    /// ```swift
+    /// Changeset(User.self)
+    ///     .change(\.email, input.email)
+    ///     .validateChanged(\.displayName)     // displayName is String
+    ///     .errors                              // [display_name: is required]
+    /// ```
+    ///
+    /// On an update changeset this always passes: the original already
+    /// supplies the value, so an untouched field is not a missing one. Use
+    /// it on optional fields too when the *write itself* must set them —
+    /// there, a change to `nil` counts as present, which
+    /// ``validateRequired(_:)`` would reject.
+    public consuming func validateChanged<V>(
+        _ field: KeyPath<Model, V>, message: String = "is required"
+    ) -> Changeset {
+        let name = Model.column(for: field).name
+        if original == nil, changes[name] == nil {
+            return appending(ChangesetError(field: name, message: message))
         }
         return self
     }
@@ -34,7 +67,7 @@ extension Changeset {
     ///     .validate(\.displayName, .length(1...80))
     ///     .errors                     // [display_name: length must be within 1...80]
     /// ```
-    public func validate<V>(
+    public consuming func validate<V>(
         _ field: WritableKeyPath<Model, V>, _ rule: ValidationRule<V>
     ) -> Changeset {
         applyRule(rule, toChangeAt: Model.column(for: field).name)
@@ -45,7 +78,7 @@ extension Changeset {
     /// The rule sees the wrapped value; a change that sets the field to
     /// `nil` is skipped. Pair with ``validateRequired(_:)`` when `nil` must
     /// be rejected.
-    public func validate<V>(
+    public consuming func validate<V>(
         _ field: WritableKeyPath<Model, V?>, _ rule: ValidationRule<V>
     ) -> Changeset {
         applyRule(rule, toChangeAt: Model.column(for: field).name)
@@ -62,7 +95,7 @@ extension Changeset {
     ///     .validate(.ordered(\.startsAt, before: \.endsAt))
     ///     .errors                     // [ends_at: must be after starts_at]
     /// ```
-    public func validate(_ rule: CrossFieldRule<Model>) -> Changeset {
+    public consuming func validate(_ rule: CrossFieldRule<Model>) -> Changeset {
         if let message = rule.check(self) {
             return appending(ChangesetError(field: rule.field, message: message))
         }
@@ -89,7 +122,7 @@ extension Changeset {
     ///
     /// The changeset becomes invalid, so ``validatedChanges()`` will refuse
     /// it exactly as if a rule had failed.
-    public func addError<V>(_ field: KeyPath<Model, V>, _ message: String) -> Changeset {
+    public consuming func addError<V>(_ field: KeyPath<Model, V>, _ message: String) -> Changeset {
         appending(ChangesetError(field: Model.column(for: field).name, message: message))
     }
 
@@ -102,7 +135,7 @@ extension Changeset {
     /// ```swift
     /// changeset.addError(column: violation.columnName, "has already been taken")
     /// ```
-    public func addError(column name: String, _ message: String) -> Changeset {
+    public consuming func addError(column name: String, _ message: String) -> Changeset {
         appending(ChangesetError(field: name, message: message))
     }
 
@@ -120,6 +153,7 @@ extension Changeset {
     ///
     /// ```swift
     /// let validated = try changeset.validatedChanges()
+    /// validated.tableName          // "users"
     /// validated.changedFields      // ["age": 37]
     /// validated.identity           // ["id": 1]  — nil for an insert
     /// ```
@@ -133,7 +167,7 @@ extension Changeset {
     /// - Precondition: an update changeset's model must declare at least one
     ///   primary-key column; without one there is no way to address the row.
     public func validatedChanges() throws -> ValidatedChanges {
-        guard errors.isEmpty else {
+        guard isValid else {
             throw ChangesetValidationError(errors: errors)
         }
         let identity: [String: any Sendable]?
@@ -149,12 +183,13 @@ extension Changeset {
         } else {
             identity = nil
         }
-        return ValidatedChanges(changedFields: changes, identity: identity, lock: lock)
+        return ValidatedChanges(
+            tableName: Model.tableName, changedFields: changes, identity: identity, lock: lock)
     }
 
     // MARK: - Internals
 
-    private func applyRule<V>(_ rule: ValidationRule<V>, toChangeAt name: String) -> Changeset {
+    private consuming func applyRule<V>(_ rule: ValidationRule<V>, toChangeAt name: String) -> Changeset {
         guard let recorded = changes[name], let value = recorded as? V else {
             return self
         }

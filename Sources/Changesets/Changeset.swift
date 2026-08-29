@@ -20,6 +20,12 @@
 /// try await connection.apply(changeset.validatedChanges(), to: User.self)
 /// ```
 ///
+/// The builder methods take `self` by consumption, so a chain moves one
+/// value from stage to stage instead of copying its storage at every step.
+/// That is invisible at the call site — a changeset held in a `let` is
+/// copied implicitly, exactly as before — but it keeps a long pipeline
+/// linear rather than quadratic.
+///
 /// ## Deliberately the thin layer
 ///
 /// There is no type casting here — "is this an `Int`" is Swift's job and was
@@ -35,7 +41,10 @@
 /// - ``init(original:)``
 ///
 /// ### Recording changes
+/// - ``change(_:_:)``
 /// - ``forceChange(_:_:)``
+/// - ``updateChange(_:_:)``
+/// - ``updateChange(_:orError:_:)``
 /// - ``deleteChange(_:)``
 /// - ``merge(_:)``
 ///
@@ -44,6 +53,7 @@
 ///
 /// ### Validating
 /// - ``validateRequired(_:)``
+/// - ``validateChanged(_:message:)``
 /// - ``validate(_:)``
 /// - ``addError(_:_:)``
 ///
@@ -94,6 +104,11 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// value) and ``ValidatedChanges/identity`` (the value read from the
     /// original), so a driver that knows nothing about locking still writes
     /// the right SQL.
+    ///
+    /// The library keeps this in step with the write it describes: editing
+    /// the lock column by hand after locking retargets ``ChangesetLock/next``,
+    /// and dropping its change clears the lock entirely rather than leaving
+    /// a guard nothing advances.
     public internal(set) var lock: ChangesetLock?
 
     /// Every accumulated validation failure, in the order the rules ran —
@@ -115,10 +130,16 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// captured when a change is recorded rather than read from column
     /// metadata, which is what lets ``TableColumn`` keep its read-only
     /// `KeyPath` initializer and still support materialization.
-    internal private(set) var appliers: [String: @Sendable (inout Model) -> Void]
+    ///
+    /// Each closure captures only its keypath and takes the value from
+    /// ``changes`` at apply time, so a value is stored once rather than
+    /// twice and the two stores cannot drift.
+    internal private(set) var appliers: [String: @Sendable (inout Model, any Sendable) -> Void]
 
     /// `true` when no validation has failed.
-    public var isValid: Bool { errors.isEmpty }
+    public var isValid: Bool {
+        ownErrors.isEmpty && nestedChangesets.allSatisfy(\.isValid)
+    }
 
     /// `false` when nothing differs from the original, here or in any
     /// nested child.
@@ -144,12 +165,14 @@ public struct Changeset<Model: TableModel>: Sendable {
     ///     .change(\.displayName, "Grace")
     /// ```
     ///
-    /// - Precondition: `Model.columns` must not contain two entries with the
-    ///   same ``TableColumn/name``. Duplicate names would silently collide
-    ///   in ``changes``, so they trap here with a message naming the
-    ///   offending column.
+    /// - Precondition: in debug builds, `Model.columns` must not contain two
+    ///   entries with the same ``TableColumn/name``. Duplicate names would
+    ///   silently collide in ``changes``, so they trap here with a message
+    ///   naming the offending column. Call
+    ///   ``TableModel/validateColumnMetadata()`` from a test to check the
+    ///   same property in any build configuration.
     public init(_ type: Model.Type = Model.self) {
-        Model.assertColumnNamesAreUnique()
+        Model.assertColumnNamesAreUniqueWhenDebugging()
         self.original = nil
         self.changes = [:]
         self.ownErrors = []
@@ -166,10 +189,10 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// changeset.changes            // ["age": 37]
     /// ```
     ///
-    /// - Precondition: `Model.columns` must not contain two entries with the
-    ///   same ``TableColumn/name``.
+    /// - Precondition: in debug builds, `Model.columns` must not contain two
+    ///   entries with the same ``TableColumn/name``.
     public init(original: Model) {
-        Model.assertColumnNamesAreUnique()
+        Model.assertColumnNamesAreUniqueWhenDebugging()
         self.original = original
         self.changes = [:]
         self.ownErrors = []
@@ -194,14 +217,18 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// ```
     ///
     /// To record a change unconditionally, use ``forceChange(_:_:)``.
-    public func change<V: Sendable & Equatable>(
+    ///
+    /// - Note: Reverting the ``optimisticLock(_:)`` column this way clears
+    ///   the lock, because a version the write never advances guards
+    ///   nothing.
+    public consuming func change<V: Sendable & Equatable>(
         _ field: WritableKeyPath<Model, V> & Sendable, _ value: V
     ) -> Changeset {
         let name = Model.column(for: field).name
-        var next = self
-        if let original, original[keyPath: field] == value {
-            next.changes.removeValue(forKey: name)
-            next.appliers.removeValue(forKey: name)
+        let reverts = original?[keyPath: field] == value
+        var next = consume self
+        if reverts {
+            next.removeRecord(at: name)
         } else {
             next.record(value, at: name, field: field)
         }
@@ -213,11 +240,12 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// Non-`Equatable` values are always recorded as dirty, because there is
     /// no way to tell whether they differ. Prefer `Equatable` column types —
     /// they are what makes minimal writes minimal.
-    public func change<V: Sendable>(
+    public consuming func change<V: Sendable>(
         _ field: WritableKeyPath<Model, V> & Sendable, _ value: V
     ) -> Changeset {
-        var next = self
-        next.record(value, at: Model.column(for: field).name, field: field)
+        let name = Model.column(for: field).name
+        var next = consume self
+        next.record(value, at: name, field: field)
         return next
     }
 
@@ -232,11 +260,12 @@ public struct Changeset<Model: TableModel>: Sendable {
     ///     .change(\.displayName, input.name)   // may be a no-op
     ///     .forceChange(\.updatedAt, .now)      // always written
     /// ```
-    public func forceChange<V: Sendable>(
+    public consuming func forceChange<V: Sendable>(
         _ field: WritableKeyPath<Model, V> & Sendable, _ value: V
     ) -> Changeset {
-        var next = self
-        next.record(value, at: Model.column(for: field).name, field: field)
+        let name = Model.column(for: field).name
+        var next = consume self
+        next.record(value, at: name, field: field)
         return next
     }
 
@@ -254,16 +283,18 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// ```
     ///
     /// Because it runs *before* validation in a normal pipeline, a rule that
-    /// follows sees the normalized value.
-    public func updateChange<V: Sendable>(
+    /// follows sees the normalized value. For a normalization that can
+    /// *fail*, use ``updateChange(_:orError:_:)``.
+    public consuming func updateChange<V: Sendable>(
         _ field: WritableKeyPath<Model, V> & Sendable, _ transform: (V) -> V
     ) -> Changeset {
         let name = Model.column(for: field).name
         guard let recorded = changes[name], let typed = recorded as? V else {
             return self
         }
-        var next = self
-        next.record(transform(typed), at: name, field: field)
+        let transformed = transform(typed)
+        var next = consume self
+        next.record(transformed, at: name, field: field)
         return next
     }
 
@@ -279,15 +310,74 @@ public struct Changeset<Model: TableModel>: Sendable {
     ///     .updateChange(\.email) { $0.trimmingCharacters(in: .whitespaces).lowercased() }
     ///     .getChange(\.email)                         // "ada@example.com"
     /// ```
-    public func updateChange<V: Sendable>(
+    public consuming func updateChange<V: Sendable>(
         _ field: WritableKeyPath<Model, V?> & Sendable, _ transform: (V) -> V
     ) -> Changeset {
         let name = Model.column(for: field).name
         guard let recorded = changes[name], let typed = recorded as? V else {
             return self
         }
-        var next = self
-        next.record(V?.some(transform(typed)), at: name, field: field)
+        let transformed = V?.some(transform(typed))
+        var next = consume self
+        next.record(transformed, at: name, field: field)
+        return next
+    }
+
+    /// Transforms the recorded change for `field`, attaching `message` when
+    /// the transform cannot produce a value.
+    ///
+    /// The normalization hook for conversions that can reject their input —
+    /// parsing a phone number into E.164, canonicalizing a URL, decoding a
+    /// signed token. Returning `nil` from `transform` leaves the recorded
+    /// change as it was and records an error on the field, so the changeset
+    /// is invalid and ``validatedChanges()`` refuses it.
+    ///
+    /// ```swift
+    /// Changeset(User.self)
+    ///     .change(\.phone, input.phone)
+    ///     .updateChange(\.phone, orError: "is not a valid phone number") {
+    ///         E164.normalize($0)
+    ///     }
+    /// ```
+    ///
+    /// A field with no recorded change is left alone and `transform` is not
+    /// called — absence is ``validateRequired(_:)``'s job, exactly as with
+    /// ``updateChange(_:_:)``.
+    public consuming func updateChange<V: Sendable>(
+        _ field: WritableKeyPath<Model, V> & Sendable,
+        orError message: String,
+        _ transform: (V) -> V?
+    ) -> Changeset {
+        let name = Model.column(for: field).name
+        guard let recorded = changes[name], let typed = recorded as? V else {
+            return self
+        }
+        guard let transformed = transform(typed) else {
+            return appending(ChangesetError(field: name, message: message))
+        }
+        var next = consume self
+        next.record(transformed, at: name, field: field)
+        return next
+    }
+
+    /// Optional-field overload of `updateChange(_:orError:_:)`.
+    ///
+    /// The transform sees the *wrapped* value. A field changed to `nil`, or
+    /// not changed at all, is left alone.
+    public consuming func updateChange<V: Sendable>(
+        _ field: WritableKeyPath<Model, V?> & Sendable,
+        orError message: String,
+        _ transform: (V) -> V?
+    ) -> Changeset {
+        let name = Model.column(for: field).name
+        guard let recorded = changes[name], let typed = recorded as? V else {
+            return self
+        }
+        guard let transformed = transform(typed) else {
+            return appending(ChangesetError(field: name, message: message))
+        }
+        var next = consume self
+        next.record(V?.some(transformed), at: name, field: field)
         return next
     }
 
@@ -300,11 +390,16 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// ```swift
     /// changeset.deleteChange(\.role)      // never let the client set this
     /// ```
-    public func deleteChange<V>(_ field: KeyPath<Model, V>) -> Changeset {
+    ///
+    /// - Note: Deleting the ``optimisticLock(_:)`` column's change clears
+    ///   the lock. Keeping it would leave a write guarded by a version it
+    ///   never advances — the next stale writer would match the same
+    ///   version and overwrite silently, which is the exact failure the
+    ///   lock exists to prevent.
+    public consuming func deleteChange<V>(_ field: KeyPath<Model, V>) -> Changeset {
         let name = Model.column(for: field).name
-        var next = self
-        next.changes.removeValue(forKey: name)
-        next.appliers.removeValue(forKey: name)
+        var next = consume self
+        next.removeRecord(at: name)
         return next
     }
 
@@ -320,11 +415,27 @@ public struct Changeset<Model: TableModel>: Sendable {
     /// let full = baseChangeset.merge(adminOnlyChangeset)
     /// ```
     ///
-    /// - Precondition: both changesets must describe the same row — either
-    ///   both inserts, or both updates whose originals are the same value.
-    ///   Merging an insert with an update, or two different rows, is a
-    ///   programmer error and traps.
-    public func merge(_ other: Changeset) -> Changeset {
+    /// Nested children are replaced **per association**, matching
+    /// ``nest(_:_:)-(_,[Changeset<Child>])``: an association `other`
+    /// attaches supersedes this changeset's children for that association
+    /// entirely, rather than being spliced into them position by position.
+    /// Associations `other` says nothing about are kept as they are. That is
+    /// the only semantics that keeps the merged form describing one
+    /// submission: a shorter list of line items must not leave the longer
+    /// list's tail behind.
+    ///
+    /// An optimistic lock from `other` replaces this one, and the surviving
+    /// lock is re-pointed at whatever value the merged changes record for
+    /// its column.
+    ///
+    /// - Precondition: both changesets must describe the same row. Insert /
+    ///   update parity is checked here and traps; that the two *originals*
+    ///   are the same row cannot be checked, because `Model` need not be
+    ///   `Equatable` — merging updates over two different rows produces a
+    ///   changeset whose identity comes from this side's original and whose
+    ///   changes are a blend of both, which is a caller's bug the library
+    ///   cannot catch for you.
+    public consuming func merge(_ other: Changeset) -> Changeset {
         precondition(
             (original == nil) == (other.original == nil),
             """
@@ -332,17 +443,17 @@ public struct Changeset<Model: TableModel>: Sendable {
             \(Model.self). Both sides must describe the same row.
             """
         )
-        var next = self
+        var next = consume self
         next.changes.merge(other.changes) { _, incoming in incoming }
         next.appliers.merge(other.appliers) { _, incoming in incoming }
         next.ownErrors.append(contentsOf: other.ownErrors)
-        for child in other.nestedChangesets {
-            next.nestedChangesets.removeAll {
-                $0.association == child.association && $0.index == child.index
-            }
-            next.nestedChangesets.append(child)
+        if !other.nestedChangesets.isEmpty {
+            let replaced = Set(other.nestedChangesets.map(\.association))
+            next.nestedChangesets.removeAll { replaced.contains($0.association) }
+            next.nestedChangesets.append(contentsOf: other.nestedChangesets)
         }
         if let incoming = other.lock { next.lock = incoming }
+        next.reconcileLock()
         return next
     }
 
@@ -353,13 +464,40 @@ public struct Changeset<Model: TableModel>: Sendable {
         _ value: V, at name: String, field: WritableKeyPath<Model, V> & Sendable
     ) {
         changes.updateValue(value, forKey: name)
-        appliers.updateValue({ model in model[keyPath: field] = value }, forKey: name)
+        appliers.updateValue(
+            { model, recorded in
+                if let typed = recorded as? V { model[keyPath: field] = typed }
+            },
+            forKey: name
+        )
+        if let lock, lock.field == name {
+            self.lock = ChangesetLock(field: name, expected: lock.expected, next: value)
+        }
+    }
+
+    /// Drops a recorded change, and any lock that depended on it.
+    private mutating func removeRecord(at name: String) {
+        changes.removeValue(forKey: name)
+        appliers.removeValue(forKey: name)
+        if lock?.field == name { lock = nil }
+    }
+
+    /// Re-points the lock at whatever ``changes`` now records for its
+    /// column, or drops it when nothing does. Used where changes arrive in
+    /// bulk rather than one at a time.
+    private mutating func reconcileLock() {
+        guard let lock else { return }
+        if let recorded = changes[lock.field] {
+            self.lock = ChangesetLock(field: lock.field, expected: lock.expected, next: recorded)
+        } else {
+            self.lock = nil
+        }
     }
 
     /// Appends an error. Internal so the only public paths are the
     /// validation methods and ``addError(_:_:)``.
-    internal func appending(_ error: ChangesetError) -> Changeset {
-        var next = self
+    internal consuming func appending(_ error: ChangesetError) -> Changeset {
+        var next = consume self
         next.ownErrors.append(error)
         return next
     }

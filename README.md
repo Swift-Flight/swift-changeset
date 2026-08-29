@@ -28,7 +28,7 @@ try await repo.update(changeset.validatedChanges())
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Swift-Flight/swift-changeset", from: "0.1.0")
+    .package(url: "https://github.com/Swift-Flight/swift-changeset", from: "0.2.0")
 ]
 ```
 
@@ -77,6 +77,7 @@ structural rather than a convention you have to remember.
 
 ```swift
 let validated = try changeset.validatedChanges()
+validated.tableName       // "users"    — the write addresses its own table
 validated.changedFields   // ["display_name": "Ada Lovelace"]
 validated.identity        // ["id": 1]   — nil for an insert
 ```
@@ -119,6 +120,25 @@ changeset
     .validate(\.status, .oneOf(["draft", "published"]))
     .validate(\.handle, .excluding(["admin", "root"], message: "is reserved"))
     .validate(\.tags, .subset(of: ["swift", "server"]))
+```
+
+`validateRequired` checks that a field *has* a value; `validateChanged`
+checks that the write *supplies* one, which is the question an insert of a
+non-optional field actually raises:
+
+```swift
+Changeset(User.self)
+    .change(\.email, input.email)
+    .validateChanged(\.displayName)     // display_name: is required
+```
+
+Normalization that can reject its input records an error rather than
+returning a value:
+
+```swift
+changeset.updateChange(\.phone, orError: "is not a valid phone number") {
+    E164.normalize($0)
+}
 ```
 
 Cross-field rules run against the changeset's effective state:
@@ -220,6 +240,14 @@ validated.identity         // ["id": 1, "version": 7]
 The version column joins the `SET` with its new value and the `WHERE` with
 the value the changeset read. If another writer got there first the update
 matches no row, and the driver reports a conflict instead of a lost update.
+Integer version columns only — a UUID or timestamp lock has no single
+obvious "what comes next", and can still be written by hand out of a
+`forceChange` plus the old value in identity.
+
+Editing the version after locking re-points the lock at the value the write
+actually installs; dropping that change clears the lock, because a guard on a
+version the write never advances would let the *next* stale writer through
+silently.
 
 A driver needs no special support for this — the merge into `changedFields`
 and `identity` is the whole mechanism. `ValidatedChanges.lock` is there for a
@@ -229,7 +257,7 @@ updated":
 ```swift
 if rows == 0, let lock = validated.lock {
     throw ChangesetConflictError(
-        table: Post.tableName, field: lock.field,
+        table: validated.tableName, field: lock.field,
         expected: String(describing: lock.expected))
 }
 ```

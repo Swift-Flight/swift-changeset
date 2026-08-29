@@ -106,7 +106,56 @@ precondition(validated.identity?["id"] as? Int == 1)
 let rows = 0
 if rows == 0, let lock = validated.lock {
     let conflict = ChangesetConflictError(
-        table: Post.tableName, field: lock.field,
+        table: validated.tableName, field: lock.field,
         expected: String(describing: lock.expected))
     precondition(conflict.description.contains("version == 7"))
 }
+
+precondition(validated.tableName == "posts")
+
+// Editing the version after locking re-points the lock; dropping the change
+// clears it, rather than guarding a write that never advances the version.
+let repointed = Changeset(original: post).optimisticLock(\.version).change(\.version, 99)
+precondition(repointed.lock?.next as? Int == 99)
+precondition(try! repointed.validatedChanges().identity?["version"] as? Int == 7)
+
+let unlocked = Changeset(original: post).optimisticLock(\.version).deleteChange(\.version)
+precondition(unlocked.lock == nil)
+precondition(try! unlocked.validatedChanges().identity?["version"] == nil)
+
+// Merging replaces a whole association, exactly as re-nesting does.
+let superseded = order.merge(
+    Changeset(Order.self).nest("lineItems", [Changeset(LineItem.self).change(\.sku, "Z").change(\.quantity, 1)]))
+precondition(superseded.nested("lineItems").count == 1)
+
+// MARK: - Required and fallible normalization
+
+struct Person: TableModel {
+    var id: Int?
+    var email: String?
+    var displayName: String
+    var phone: String?
+
+    static let tableName = "people"
+    static let columns: [TableColumn<Person>] = [
+        TableColumn("id", \Person.id, primaryKey: true),
+        TableColumn("email", \Person.email),
+        TableColumn("display_name", \Person.displayName),
+        TableColumn("phone", \Person.phone),
+    ]
+}
+
+// validateRequired asks whether the row will have a value; validateChanged
+// asks whether this write supplies one.
+let missingName = Changeset(Person.self)
+    .change(\.email, "grace@example.com")
+    .validateChanged(\.displayName)
+precondition(missingName.messagesByField["display_name"] == ["is required"])
+
+// A normalization that can reject its input.
+let badPhone = Changeset(Person.self)
+    .change(\.phone, "not a phone number")
+    .updateChange(\.phone, orError: "is not a valid phone number") { value in
+        value.allSatisfy(\.isNumber) ? value : nil
+    }
+precondition(badPhone.messagesByField["phone"] == ["is not a valid phone number"])

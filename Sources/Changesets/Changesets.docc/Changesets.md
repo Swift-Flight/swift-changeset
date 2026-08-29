@@ -83,6 +83,7 @@ column written regardless — a timestamp, a revision counter — reach for
 
 - ``ValidationRule``
 - ``CrossFieldRule``
+- ``Changeset/validateChanged(_:message:)``
 - ``ChangesetError``
 - ``ChangesetValidationError``
 

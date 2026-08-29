@@ -114,6 +114,27 @@ changeset
     .validate(\.email, .email)
 ```
 
+### Required on an insert
+
+``Changeset/validateRequired(_:)`` answers "will this row have a value?",
+which a non-optional property answers by existing. It cannot answer "does
+*this insert* supply one" — an untouched non-optional field is simply absent
+from the write, and the first thing to notice would be the store's `NOT NULL`
+error, far from the form that could have said so.
+
+``Changeset/validateChanged(_:message:)`` is that check:
+
+```swift
+Changeset(User.self)
+    .change(\.email, input.email)
+    .validateChanged(\.displayName)      // display_name: is required
+```
+
+It passes on an update changeset, where the original already supplies the
+value, and on an optional field it counts a write of `nil` as present —
+which is exactly the case ``Changeset/validateRequired(_:)`` rejects. The two
+answer different questions; use whichever question you mean.
+
 ## Cross-field rules
 
 Some properties are not about one field. ``CrossFieldRule`` runs against the

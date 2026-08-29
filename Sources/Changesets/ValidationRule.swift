@@ -115,7 +115,10 @@ extension ValidationRule where V == String {
         }
         let failure = message ?? "has invalid format"
         return ValidationRule { value in
-            guard let regex = try? Regex(pattern) else { return failure }
+            // Force-tried, not `try?`: the pattern compiled a moment ago in
+            // this same process, so a failure here is impossible rather than
+            // a case to fold into "the value did not match".
+            let regex = try! Regex(pattern)
             return value.firstMatch(of: regex) != nil ? nil : failure
         }
     }
@@ -128,9 +131,53 @@ extension ValidationRule where V == String {
     /// ```swift
     /// changeset.validate(\.email, .email)
     /// ```
+    ///
+    /// The shape it accepts is exactly `[^\s@]+@[^\s@]+\.[^\s@]+` anchored
+    /// to the whole value, but it is scanned by hand rather than by a
+    /// regular expression: this is the most-used rule in the library, and a
+    /// single pass over the value's scalars costs no compile, no allocation,
+    /// and no per-evaluation setup.
     public static var email: ValidationRule {
-        .matches(#"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, message: "is not a valid email address")
+        ValidationRule { value in
+            isEmailShaped(value) ? nil : "is not a valid email address"
+        }
     }
+}
+
+/// One pass over `value`'s scalars, accepting exactly what
+/// `^[^\s@]+@[^\s@]+\.[^\s@]+$` accepts: a non-empty local part, a single
+/// `@`, and a domain carrying a `.` that is neither its first nor its last
+/// scalar — with no whitespace anywhere.
+///
+/// Note that `[^\s@]` matches `.` as well, so a domain may hold further
+/// dots on either side of the one that has to be there; only the shape of
+/// the whole is constrained.
+internal func isEmailShaped(_ value: String) -> Bool {
+    var localCount = 0
+    var domainCount = 0
+    var dotIndex = -1
+    var sawAt = false
+
+    for scalar in value.unicodeScalars {
+        if scalar.properties.isWhitespace { return false }
+        if scalar == "@" {
+            if sawAt || localCount == 0 { return false }
+            sawAt = true
+            continue
+        }
+        guard sawAt else {
+            localCount += 1
+            continue
+        }
+        // The earliest dot with something before it: the one most likely to
+        // leave room for something after it too.
+        if scalar == ".", dotIndex < 0, domainCount >= 1 {
+            dotIndex = domainCount
+        }
+        domainCount += 1
+    }
+
+    return sawAt && dotIndex >= 1 && domainCount >= dotIndex + 2
 }
 
 // MARK: - Collections
@@ -172,12 +219,11 @@ extension ValidationRule where V: Collection & Sendable, V.Element: Hashable & S
     ) -> ValidationRule {
         let permitted = Set(allowed)
         return ValidationRule { value in
+            // The pass path is the common one, and it needs no set of its own.
+            guard !value.allSatisfy(permitted.contains) else { return nil }
             let extras = Set(value).subtracting(permitted)
-            guard extras.isEmpty else {
-                let listed = extras.map { String(describing: $0) }.sorted().joined(separator: ", ")
-                return message ?? "contains values that are not allowed: \(listed)"
-            }
-            return nil
+            let listed = extras.map { String(describing: $0) }.sorted().joined(separator: ", ")
+            return message ?? "contains values that are not allowed: \(listed)"
         }
     }
 }

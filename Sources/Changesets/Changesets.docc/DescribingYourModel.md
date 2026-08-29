@@ -111,7 +111,9 @@ The distinction is load-bearing, not incidental:
 - A **non-optional** property is guaranteed present by the type system.
   ``Changeset/validateRequired(_:)`` will not compile against it, which is
   the type system correctly refusing to let you check something it already
-  guarantees.
+  guarantees. On an *insert* the open question is different — did this write
+  supply a value at all? — and that one is
+  ``Changeset/validateChanged(_:message:)``.
 - An **optional** property can be required, cleared, or left alone — and
   ``Changeset/changed(_:)`` is how you tell "cleared" from "left alone",
   since both read as `nil` through `value(_:)`.
@@ -128,7 +130,8 @@ any field to the value it already holds is not a change.
 ## Checking metadata in tests
 
 ``TableModel/validateColumnMetadata()`` runs the same checks a changeset runs
-at construction. Calling it in a test pins the mistake to the model rather
+at construction — where they run in debug builds only, since they verify a
+property of the type that cannot change at runtime. Calling it in a test pins the mistake to the model rather
 than to whichever feature happened to touch the field first:
 
 ```swift

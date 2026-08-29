@@ -10,6 +10,16 @@
 /// which throws on an invalid changeset — so an invalid one can never reach
 /// a driver. The initializer is public for driver test fixtures.
 public struct ValidatedChanges: Sendable {
+    /// The table/collection the write targets — ``TableModel/tableName`` of
+    /// the changeset's model.
+    ///
+    /// Carried here so the handoff is self-addressing: a driver API can take
+    /// a bare `ValidatedChanges` rather than a value plus the table name its
+    /// caller had to remember to pass alongside. ``NestedChangeset`` has
+    /// always exposed the same thing, because its model type is erased; this
+    /// makes the parent and its children symmetric.
+    public let tableName: String
+
     /// ONLY the fields that changed — this is what enables minimal writes.
     /// Keys are store-neutral column names (`TableColumn.name`); values may
     /// box an `Optional.none` to mean "set to NULL/absent".
@@ -33,16 +43,19 @@ public struct ValidatedChanges: Sendable {
     /// let rows = try await connection.update(validated)
     /// if rows == 0, let lock = validated.lock {
     ///     throw ChangesetConflictError(
-    ///         table: table, field: lock.field, expected: String(describing: lock.expected))
+    ///         table: validated.tableName, field: lock.field,
+    ///         expected: String(describing: lock.expected))
     /// }
     /// ```
     public let lock: ChangesetLock?
 
     public init(
+        tableName: String,
         changedFields: [String: any Sendable],
         identity: [String: any Sendable]?,
         lock: ChangesetLock? = nil
     ) {
+        self.tableName = tableName
         self.changedFields = changedFields
         self.identity = identity
         self.lock = lock

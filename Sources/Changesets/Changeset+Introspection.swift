@@ -119,7 +119,9 @@ extension Changeset {
     /// ```
     public func applyChanges() -> Model? {
         guard var model = original else { return nil }
-        for apply in appliers.values { apply(&model) }
+        for (name, apply) in appliers {
+            if let recorded = changes[name] { apply(&model, recorded) }
+        }
         return model
     }
 
@@ -135,7 +137,9 @@ extension Changeset {
     /// ```
     public func applyChanges(to base: Model) -> Model {
         var model = base
-        for apply in appliers.values { apply(&model) }
+        for (name, apply) in appliers {
+            if let recorded = changes[name] { apply(&model, recorded) }
+        }
         return model
     }
 }
